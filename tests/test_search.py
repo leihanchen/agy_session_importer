@@ -74,6 +74,8 @@ class MockSearchProvider(SessionProvider):
         bodies: dict[str, str] | None = None,
         available: bool = True,
         raise_on_list: bool = False,
+        raise_on_load: bool = False,
+        raise_on_load_refs: set[str] | None = None,
     ) -> None:
         self.name = name
         self.display_name = name.upper()
@@ -83,6 +85,8 @@ class MockSearchProvider(SessionProvider):
         self._bodies = dict(bodies or {})
         self._available = available
         self._raise_on_list = raise_on_list
+        self._raise_on_load = raise_on_load
+        self._raise_on_load_refs = set(raise_on_load_refs or ())
         self.extract_calls: list[tuple[str, int]] = []
         self.load_calls: list[tuple[str, int]] = []
 
@@ -103,6 +107,8 @@ class MockSearchProvider(SessionProvider):
     def load_session(self, ref: str, *, max_tool_chars: int = 600) -> SessionDetail:
         self.load_calls.append((ref, max_tool_chars))
         ref_clean = ref.strip()
+        if self._raise_on_load or ref_clean in self._raise_on_load_refs:
+            raise ProviderReadError(f"{self.name} failed reading {ref_clean}")
         target = None
         for s in self._sessions:
             if s.session_id.lower() == ref_clean.lower() or s.source_path == ref_clean:
@@ -740,6 +746,108 @@ class TestSearchAndResolution(unittest.TestCase):
                 reg, cwd=str(repo), query="resume my gemini_cli session"
             )
             self.assertEqual(stop_list, [])
+
+    def test_mixed_cjk_ascii_fields_match_short_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+
+            prov = MockSearchProvider(
+                "codex",
+                sessions=[
+                    _make_summary(
+                        provider="codex",
+                        session_id="sess-1",
+                        cwd=str(repo),
+                        title="修复API问题",
+                        updated_at="2026-11-20T05:00:00Z",
+                    ),
+                    _make_summary(
+                        provider="codex",
+                        session_id="sess-2",
+                        cwd=str(repo),
+                        title="修复接口问题",
+                        updated_at="2026-11-20T04:00:00Z",
+                    ),
+                    _make_summary(
+                        provider="codex",
+                        session_id="sess-3",
+                        cwd=str(repo),
+                        title="Build release pipeline",
+                        updated_at="2026-11-20T03:00:00Z",
+                    ),
+                ],
+            )
+            reg = ProviderRegistry()
+            reg.register(prov)
+
+            # Short non-CJK token ("api", len 3) inside mixed CJK+ASCII title ("修复API问题")
+            api_res = resolve_session(reg, "api", cwd=str(repo))
+            self.assertEqual(api_res.status, "matched")
+            self.assertEqual(api_res.detail.summary.session_id, "sess-1")
+
+            # Mixed query against identical title achieves matched_all_tokens=True despite CJK bigram runner-up
+            # Use equal weights across title ("修复API问题") vs title ("修复页面样式" + prompt "修复")
+            full_res = resolve_session(reg, "修复API问题", cwd=str(repo))
+            self.assertEqual(full_res.status, "matched")
+            self.assertEqual(full_res.detail.summary.session_id, "sess-1")
+
+            # 2-char token "ui" must still not false-match inside "build"
+            ui_res = resolve_session(reg, "ui", cwd=str(repo))
+            self.assertEqual(ui_res.status, "no_match")
+
+    def test_load_session_provider_read_error_degrades_gracefully(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+
+            bad_file = repo / "corrupt.mock"
+            bad_file.write_text("corrupt", encoding="utf-8")
+
+            sid_broken = "11111111-2222-4333-8444-555555555555"
+            sid_ok = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
+
+            prov = MockSearchProvider(
+                "codex",
+                suffix=".mock",
+                sessions=[
+                    _make_summary(
+                        provider="codex",
+                        session_id=sid_broken,
+                        cwd=str(repo),
+                        title="Unreadable rollout session",
+                        source_path=str(bad_file),
+                        updated_at="2026-11-20T06:00:00Z",
+                    ),
+                    _make_summary(
+                        provider="codex",
+                        session_id=sid_ok,
+                        cwd=str(repo),
+                        title="Healthy fallback session",
+                        updated_at="2026-11-20T05:00:00Z",
+                    ),
+                ],
+                raise_on_load_refs={sid_broken, str(bad_file)},
+            )
+            reg = ProviderRegistry()
+            reg.register(prov)
+
+            for ref_val in ("latest", sid_broken, "unreadable rollout"):
+                res = resolve_session(reg, ref_val, cwd=str(repo))
+                self.assertEqual(res.status, "no_match")
+                self.assertEqual(res.reason, "provider_read_error")
+                self.assertEqual(res.provider, "codex")
+                self.assertIsNone(res.detail)
+                self.assertTrue(any("codex_read_error:" in w for w in res.warnings))
+                self.assertTrue(len(res.candidates) >= 1)
+
+            explicit_res = resolve_session(reg, str(bad_file), cwd=str(repo))
+            self.assertEqual(explicit_res.status, "no_match")
+            self.assertEqual(explicit_res.reason, "provider_read_error")
+            self.assertEqual(explicit_res.provider, "codex")
+            self.assertIsNone(explicit_res.detail)
+            self.assertEqual(explicit_res.candidates, [])
+            self.assertTrue(any("codex_read_error:" in w for w in explicit_res.warnings))
 
 
 if __name__ == "__main__":

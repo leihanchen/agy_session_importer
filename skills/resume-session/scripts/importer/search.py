@@ -197,6 +197,20 @@ def _emit_cjk_tokens(run: str, stop_words: set[str], out: list[str], seen: set[s
         _append_token(tok, stop_words, out, seen)
 
 
+def _split_cjk_boundaries(segment: str) -> list[tuple[bool, str]]:
+    """Split an alphanumeric segment into alternating (is_cjk, substring) pieces."""
+    parts: list[tuple[bool, str]] = []
+    pos = 0
+    for match in _CJK_RE.finditer(segment):
+        if match.start() > pos:
+            parts.append((False, segment[pos : match.start()]))
+        parts.append((True, match.group(0)))
+        pos = match.end()
+    if pos < len(segment):
+        parts.append((False, segment[pos:]))
+    return parts
+
+
 def tokenize_query(
     query: str, *, extra_stop_words: set[str] | None = None
 ) -> list[str]:
@@ -221,14 +235,11 @@ def tokenize_query(
         for segment in _ALNUM_SEGMENT_RE.findall(chunk):
             if segment in stop_words:
                 continue
-            pos = 0
-            for match in _CJK_RE.finditer(segment):
-                if match.start() > pos:
-                    _append_token(segment[pos : match.start()], stop_words, tokens, seen)
-                _emit_cjk_tokens(match.group(0), stop_words, tokens, seen)
-                pos = match.end()
-            if pos < len(segment):
-                _append_token(segment[pos:], stop_words, tokens, seen)
+            for is_cjk, part in _split_cjk_boundaries(segment):
+                if is_cjk:
+                    _emit_cjk_tokens(part, stop_words, tokens, seen)
+                else:
+                    _append_token(part, stop_words, tokens, seen)
 
     return tokens
 
@@ -239,8 +250,13 @@ def _prepare_field(text: str) -> tuple[str, set[str]]:
     normalized = unicodedata.normalize("NFKC", text)
     lowered = normalized.lower()
     camel_split = _CAMEL_BOUNDARY_RE.sub(r"\1 \2", normalized).lower()
-    word_tokens = set(_ALNUM_SEGMENT_RE.findall(lowered))
-    word_tokens.update(_ALNUM_SEGMENT_RE.findall(camel_split))
+    word_tokens: set[str] = set()
+    for variant in (lowered, camel_split):
+        for segment in _ALNUM_SEGMENT_RE.findall(variant):
+            word_tokens.add(segment)
+            for is_cjk, part in _split_cjk_boundaries(segment):
+                if not is_cjk:
+                    word_tokens.add(part)
     return lowered, word_tokens
 
 
@@ -432,6 +448,33 @@ def _recent_summaries(
     return [it.summary for it in ordered[:max(0, limit)]]
 
 
+def _try_load_session(
+    provider: SessionProvider,
+    load_ref: str,
+    *,
+    max_tool_chars: int,
+    base_warnings: list[str],
+    fallback_items: list[_DiscoveredSession] | None = None,
+) -> tuple[SessionDetail | None, ResolutionResult | None]:
+    try:
+        return provider.load_session(load_ref, max_tool_chars=max_tool_chars), None
+    except ProviderReadError as exc:
+        candidates = (
+            _recent_summaries(fallback_items, repo_first=True, limit=_MAX_CANDIDATES)
+            if fallback_items
+            else []
+        )
+        return None, ResolutionResult(
+            status="no_match",
+            reason="provider_read_error",
+            provider=provider.name,
+            cross_repo=False,
+            detail=None,
+            candidates=candidates,
+            warnings=_merge_warnings(base_warnings, [f"{provider.name}_read_error: {exc}"]),
+        )
+
+
 def _load_matched_result(
     provider: SessionProvider,
     load_ref: str,
@@ -440,8 +483,18 @@ def _load_matched_result(
     reason: str,
     max_tool_chars: int,
     base_warnings: list[str],
+    fallback_items: list[_DiscoveredSession] | None = None,
 ) -> ResolutionResult:
-    detail = provider.load_session(load_ref, max_tool_chars=max_tool_chars)
+    detail, err_result = _try_load_session(
+        provider,
+        load_ref,
+        max_tool_chars=max_tool_chars,
+        base_warnings=base_warnings,
+        fallback_items=fallback_items,
+    )
+    if err_result is not None:
+        return err_result
+    assert detail is not None
     return ResolutionResult(
         status="matched",
         reason=reason,
@@ -485,7 +538,15 @@ def _resolve_explicit_path(
             warnings=[f"No registered provider recognizes path: {path}"],
         )
 
-    detail = detected.load_session(str(path), max_tool_chars=max_tool_chars)
+    detail, err_result = _try_load_session(
+        detected,
+        str(path),
+        max_tool_chars=max_tool_chars,
+        base_warnings=[],
+    )
+    if err_result is not None:
+        return err_result
+    assert detail is not None
     cross_repo = match_repo(detail.summary.cwd, target_cwd) == "different"
     if cross_repo and not allow_cross_repo:
         return ResolutionResult(
@@ -558,6 +619,7 @@ def _resolve_by_id(
             reason="session_id",
             max_tool_chars=max_tool_chars,
             base_warnings=warnings,
+            fallback_items=items,
         )
 
     ordered = sorted(matches, key=lambda it: _recency_sort_key(it, repo_first=True), reverse=True)
@@ -620,6 +682,7 @@ def _resolve_latest(
         reason="latest_same_repo",
         max_tool_chars=max_tool_chars,
         base_warnings=warnings,
+        fallback_items=items,
     )
 
 
@@ -766,6 +829,7 @@ def resolve_session(
             reason=match_reason,
             max_tool_chars=max_tool_chars,
             base_warnings=warnings,
+            fallback_items=discovered,
         )
 
     top_cross_repo = not scored[0].item.in_current_repo
