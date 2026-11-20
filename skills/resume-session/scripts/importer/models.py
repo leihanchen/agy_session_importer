@@ -5,9 +5,20 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import math
+import re
 from typing import Any
 
 _MS_THRESHOLD = 1_000_000_000_000
+_FRACTIONAL_SECONDS_RE = re.compile(r"(\d{2}:\d{2}:\d{2})\.(\d+)")
+
+
+def _normalize_iso_fractional_seconds(iso: str) -> str:
+    """Normalize ISO-8601 fractional seconds to 6 digits for Python 3.10 compatibility."""
+    return _FRACTIONAL_SECONDS_RE.sub(
+        lambda m: f"{m.group(1)}.{m.group(2)[:6].ljust(6, '0')}",
+        iso,
+        count=1,
+    )
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -32,6 +43,7 @@ def _parse_datetime(value: Any) -> datetime | None:
         if not raw:
             return None
         iso = f"{raw[:-1]}+00:00" if raw.endswith(("Z", "z")) else raw
+        iso = _normalize_iso_fractional_seconds(iso)
         try:
             dt = datetime.fromisoformat(iso)
             return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
