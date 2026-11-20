@@ -106,8 +106,10 @@ class ProviderRegistry:
 
 def create_default_registry(roots: dict[str, Path] | None = None) -> ProviderRegistry:
     """Create the default ProviderRegistry with built-in providers registered."""
+    from importer.providers.claude import ClaudeProvider
     from importer.providers.codex import CodexProvider
 
     registry = ProviderRegistry()
     registry.register(CodexProvider(root=roots.get("codex") if roots else None))
+    registry.register(ClaudeProvider(root=roots.get("claude") if roots else None))
     return registry
