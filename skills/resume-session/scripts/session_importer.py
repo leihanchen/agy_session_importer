@@ -195,6 +195,13 @@ def _emit_error(message: str, *, use_json: bool) -> None:
         print(f"error: {message}", file=sys.stderr)
 
 
+def _resolve_providers(registry: ProviderRegistry, selector: str) -> None:
+    try:
+        registry.resolve(selector)
+    except ValueError as exc:
+        raise _CliValidationError(str(exc)) from exc
+
+
 def _handle_providers(registry: ProviderRegistry, args: argparse.Namespace) -> None:
     providers = registry.describe()
     payload = {"schema_version": 1, "providers": providers}
@@ -204,7 +211,7 @@ def _handle_providers(registry: ProviderRegistry, args: argparse.Namespace) -> N
 def _handle_list(registry: ProviderRegistry, args: argparse.Namespace) -> None:
     _validate_non_negative("--within-min", args.within_min)
     _validate_non_negative("--limit", args.limit)
-    registry.resolve(args.provider)
+    _resolve_providers(registry, args.provider)
 
     sessions, warnings = list_sessions(
         registry,
@@ -231,7 +238,7 @@ def _handle_show(registry: ProviderRegistry, args: argparse.Namespace) -> None:
     _validate_positive("--max-chars", args.max_chars)
     _validate_non_negative("--max-tool-chars", args.max_tool_chars)
     _validate_non_negative("--tail-turns", args.tail_turns)
-    registry.resolve(args.provider)
+    _resolve_providers(registry, args.provider)
 
     result = resolve_session(
         registry,
@@ -252,7 +259,7 @@ def _handle_show(registry: ProviderRegistry, args: argparse.Namespace) -> None:
 
 def _handle_turns(registry: ProviderRegistry, args: argparse.Namespace) -> None:
     _validate_non_negative("--max-tool-chars", args.max_tool_chars)
-    registry.resolve(args.provider)
+    _resolve_providers(registry, args.provider)
     start, end = _parse_range(args.turn_range)
 
     result = resolve_session(
@@ -269,7 +276,10 @@ def _handle_turns(registry: ProviderRegistry, args: argparse.Namespace) -> None:
             f"(status={result.status}, reason={result.reason})"
         )
 
-    envelope = render_turns_envelope(result.detail, start, end)
+    try:
+        envelope = render_turns_envelope(result.detail, start, end)
+    except ValueError as exc:
+        raise _CliValidationError(str(exc)) from exc
     _emit_output(envelope, _format_turns_text(envelope), use_json=args.json)
 
 
@@ -277,10 +287,10 @@ def main(argv: list[str] | None = None, *, registry: ProviderRegistry | None = N
     """Execute the session_importer CLI and return a process exit code."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     use_json = "--json" in raw_argv
-    active_registry = create_default_registry() if registry is None else registry
-    parser = build_parser(active_registry)
 
     try:
+        active_registry = create_default_registry() if registry is None else registry
+        parser = build_parser(active_registry)
         args = parser.parse_args(raw_argv)
         use_json = bool(getattr(args, "json", False)) or use_json
 
@@ -299,7 +309,7 @@ def main(argv: list[str] | None = None, *, registry: ProviderRegistry | None = N
         if isinstance(exc.code, int):
             return exc.code
         return 0 if exc.code is None else 1
-    except (_CliValidationError, ValueError) as exc:
+    except _CliValidationError as exc:
         _emit_error(str(exc), use_json=use_json)
         return 2
     except Exception as exc:

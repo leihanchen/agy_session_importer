@@ -148,10 +148,14 @@ def match_repo(session_cwd: str, target_cwd: str) -> str:
 
 def open_sqlite_readonly(path: Path, *, timeout: float = 2.0) -> sqlite3.Connection:
     """Open a SQLite database in strict read-only mode preserving WAL visibility."""
-    resolved = Path(path).resolve()
-    if not resolved.is_file():
+    try:
+        resolved = Path(path).resolve()
+        is_file = resolved.is_file()
+        uri = f"{resolved.as_uri()}?mode=ro"
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProviderReadError(f"Unable to resolve SQLite database '{path}': {exc}") from exc
+    if not is_file:
         raise ProviderReadError(f"SQLite database not found: {path}")
-    uri = f"{resolved.as_uri()}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=timeout)
     except (sqlite3.Error, OSError, ValueError) as exc:

@@ -1060,6 +1060,214 @@ class TestClaudeProvider(unittest.TestCase):
             self.assertFalse(detail.turns[0].compaction_before)
             self.assertTrue(detail.turns[1].compaction_before)
 
+    def test_claude_abandoned_tool_result_retry_sibling_does_not_overwrite_active_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "claude_home"
+            sid = "56565656-5656-4565-8565-565656565656"
+            jsonl = root / "projects" / "-tmp-retry" / f"{sid}.jsonl"
+
+            _write_jsonl(
+                jsonl,
+                [
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "parentUuid": None,
+                        "sessionId": sid,
+                        "cwd": tmp,
+                        "timestamp": "2026-11-20T16:00:00Z",
+                        "message": {"role": "user", "content": "Run parallel tools"},
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "parentUuid": "u1",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T16:00:05Z",
+                        "message": {
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "cmd1"}},
+                                {"type": "tool_use", "id": "tu_2", "name": "Read", "input": {"file_path": "a.py"}},
+                            ],
+                        },
+                    },
+                    # Active branch answers tu_1 cleanly
+                    {
+                        "type": "user",
+                        "uuid": "tr_active",
+                        "parentUuid": "a1",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T16:00:10Z",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": "tu_1", "is_error": False, "content": "active_ok"}
+                            ],
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "a2",
+                        "parentUuid": "tr_active",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T16:00:15Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+                    },
+                    # Abandoned retry sibling appears AFTER tr_active in file order and only answers tu_1 with error
+                    {
+                        "type": "user",
+                        "uuid": "tr_abandoned_only_tu1",
+                        "parentUuid": "a1",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T16:00:20Z",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tu_1",
+                                    "is_error": True,
+                                    "content": "ABANDONED_RETRY_ERROR",
+                                }
+                            ],
+                        },
+                    },
+                    # Mixed sibling answers tu_2 (missing from chain) AND also repeats tu_1 (already on chain)
+                    {
+                        "type": "user",
+                        "uuid": "tr_mixed_tu2",
+                        "parentUuid": "a1",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T16:00:25Z",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tu_1",
+                                    "is_error": True,
+                                    "content": "MIXED_STALE_TU1_OVERWRITE",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tu_2",
+                                    "is_error": False,
+                                    "content": "tu2_recovered_ok",
+                                },
+                            ],
+                        },
+                    },
+                    {"type": "last-prompt", "lastPrompt": "Run parallel tools", "leafUuid": "a2", "sessionId": sid},
+                ],
+            )
+
+            provider = ClaudeProvider(root=root)
+            detail = provider.load_session(sid)
+
+            self.assertEqual(len(detail.turns), 1)
+            events = {ev.call_id: ev for ev in detail.turns[0].tool_events}
+            self.assertEqual(events["tu_1"].output_summary, "active_ok")
+            self.assertEqual(events["tu_1"].status, "ok")
+            self.assertEqual(events["tu_2"].output_summary, "tu2_recovered_ok")
+            self.assertEqual(events["tu_2"].status, "ok")
+
+    def test_claude_unused_history_display_secrets_do_not_inflate_secrets_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "claude_home"
+            sid = "78787878-7878-4787-8787-787878787878"
+            sid_fallback = "89898989-8989-4898-8898-898989898989"
+            proj = root / "projects" / "-tmp-hist"
+
+            _write_jsonl(
+                proj / f"{sid}.jsonl",
+                [
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "parentUuid": None,
+                        "sessionId": sid,
+                        "cwd": tmp,
+                        "timestamp": "2026-11-20T17:00:00Z",
+                        "message": {"role": "user", "content": "Clean JSONL first prompt"},
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "parentUuid": "u1",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T17:00:05Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Clean reply."}]},
+                    },
+                    {
+                        "type": "user",
+                        "uuid": "u2",
+                        "parentUuid": "a1",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T17:01:00Z",
+                        "message": {"role": "user", "content": "Clean JSONL last prompt"},
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "a2",
+                        "parentUuid": "u2",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T17:01:05Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+                    },
+                    {"type": "last-prompt", "lastPrompt": "Clean JSONL last prompt", "leafUuid": "a2", "sessionId": sid},
+                ],
+            )
+            _write_jsonl(
+                proj / f"{sid_fallback}.jsonl",
+                [
+                    {
+                        "type": "assistant",
+                        "uuid": "f-a1",
+                        "parentUuid": None,
+                        "sessionId": sid_fallback,
+                        "cwd": tmp,
+                        "timestamp": "2026-11-20T17:02:00Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Assistant only."}]},
+                    },
+                ],
+            )
+            _write_jsonl(
+                root / "history.jsonl",
+                [
+                    {
+                        "display": "Unused history first sk-proj-abc1234567890xyz",
+                        "project": tmp,
+                        "sessionId": sid,
+                        "timestamp": 1795164000000,
+                    },
+                    {
+                        "display": "Unused history last ghp_1234567890abcdefghijklmnopqrstuvwxyz",
+                        "project": tmp,
+                        "sessionId": sid,
+                        "timestamp": 1795164060000,
+                    },
+                    {
+                        "display": "Fallback prompt with sk-proj-fallback1234567890",
+                        "project": tmp,
+                        "sessionId": sid_fallback,
+                        "timestamp": 1795164120000,
+                    },
+                ],
+            )
+
+            provider = ClaudeProvider(root=root)
+            detail = provider.load_session(sid)
+            self.assertEqual(detail.warnings, [])
+            self.assertEqual(detail.summary.first_user_prompt, "Clean JSONL first prompt")
+            self.assertEqual(detail.summary.last_user_prompt, "Clean JSONL last prompt")
+
+            fallback_detail = provider.load_session(sid_fallback)
+            self.assertIn("secrets_redacted:1", fallback_detail.warnings)
+            self.assertNotIn("sk-proj-fallback", fallback_detail.summary.first_user_prompt)
+            self.assertIn("[REDACTED]", fallback_detail.summary.first_user_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

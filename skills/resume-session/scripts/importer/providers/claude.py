@@ -421,6 +421,48 @@ def _resolve_title(
     return ""
 
 
+def _drop_answered_tool_result_blocks(
+    content: list[Any], answered_tool_use_ids: set[str]
+) -> list[Any]:
+    return [
+        block
+        for block in content
+        if not (
+            isinstance(block, dict)
+            and str(block.get("type") or "").lower() == "tool_result"
+            and _clean_str(block.get("tool_use_id")) in answered_tool_use_ids
+        )
+    ]
+
+
+def _filter_sibling_tool_results(
+    record: dict[str, Any],
+    answered_tool_use_ids: set[str],
+) -> dict[str, Any]:
+    """Return a copy of a sibling record excluding tool_results already answered on chain."""
+    if not answered_tool_use_ids:
+        return record
+    msg = record.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("content"), list):
+        filtered = _drop_answered_tool_result_blocks(msg["content"], answered_tool_use_ids)
+        if len(filtered) == len(msg["content"]):
+            return record
+        cloned_msg = dict(msg)
+        cloned_msg["content"] = filtered
+        cloned_rec = dict(record)
+        cloned_rec["message"] = cloned_msg
+        return cloned_rec
+    content = record.get("content")
+    if isinstance(content, list):
+        filtered = _drop_answered_tool_result_blocks(content, answered_tool_use_ids)
+        if len(filtered) == len(content):
+            return record
+        cloned_rec = dict(record)
+        cloned_rec["content"] = filtered
+        return cloned_rec
+    return record
+
+
 def _update_ts_bounds(
     ts_raw: Any,
     created_at: str,
@@ -631,15 +673,22 @@ class ClaudeProvider(SessionProvider):
         secret_counter: list[int],
     ) -> SessionSummary:
         norm_cwd = self._resolve_cwd(path, raw_cwd, hist)
-        hist_first = _preview_line(hist.get("first_display", ""), _PROMPT_PREVIEW_LIMIT, secret_counter)
-        hist_last = _preview_line(hist.get("last_display", ""), _PROMPT_PREVIEW_LIMIT, secret_counter)
-        resolved_first = first_prompt or hist_first
-        resolved_last = (
-            last_prompt
-            or _preview_line(last_prompt_text, _PROMPT_PREVIEW_LIMIT, secret_counter)
-            or hist_last
-            or resolved_first
+        resolved_first = first_prompt or _preview_line(
+            hist.get("first_display", ""), _PROMPT_PREVIEW_LIMIT, secret_counter
         )
+        if last_prompt:
+            resolved_last = last_prompt
+        else:
+            resolved_last = _preview_line(last_prompt_text, _PROMPT_PREVIEW_LIMIT, secret_counter)
+            if not resolved_last:
+                raw_hist_last = hist.get("last_display", "")
+                if raw_hist_last and raw_hist_last == hist.get("first_display", "") and not first_prompt:
+                    resolved_last = resolved_first
+                else:
+                    resolved_last = (
+                        _preview_line(raw_hist_last, _PROMPT_PREVIEW_LIMIT, secret_counter)
+                        or resolved_first
+                    )
         resolved_created = created_at or hist.get("first_ts", "")
         resolved_updated = updated_at or hist.get("last_ts", "")
         title = _resolve_title(
@@ -647,8 +696,8 @@ class ClaudeProvider(SessionProvider):
             ai_title=ai_title,
             summaries=summaries,
             active_leaf_uuid=active_leaf_uuid,
-            first_prompt=first_prompt,
-            history_display=hist.get("first_display", ""),
+            first_prompt=resolved_first,
+            history_display="",
             secret_counter=secret_counter,
         )
         return SessionSummary(
@@ -1068,18 +1117,34 @@ class ClaudeProvider(SessionProvider):
                 if tid:
                     chain_tool_use_ids.add(tid)
 
+        answered_tool_use_ids: set[str] = set()
+        for _, rec in chain:
+            if rec.get("type") != "user" or _is_filtered_record(rec):
+                continue
+            _, _, tr_blocks = _extract_content_blocks(
+                _get_message_content(rec), collect_tool_results=True
+            )
+            for block in tr_blocks:
+                tid = _clean_str(block.get("tool_use_id"))
+                if tid:
+                    answered_tool_use_ids.add(tid)
+
+        missing_tool_use_ids = chain_tool_use_ids - answered_tool_use_ids
+
         recovered_tool_results: list[tuple[int, dict[str, Any]]] = []
         for file_idx, rec in non_sidechain:
             uid = _clean_str(rec.get("uuid"))
             if uid in chain_uuids or not _is_tool_result_only_user(rec):
                 continue
-            parent = _raw_claude_parent(rec)
             _, _, tr_blocks = _extract_content_blocks(
                 _get_message_content(rec), collect_tool_results=True
             )
-            tr_ids = {_clean_str(b.get("tool_use_id")) for b in tr_blocks}
-            if parent in assistant_uuids or bool(tr_ids & chain_tool_use_ids):
-                recovered_tool_results.append((file_idx, rec))
+            tr_ids = {_clean_str(b.get("tool_use_id")) for b in tr_blocks} - {""}
+            if not (tr_ids & missing_tool_use_ids):
+                continue
+            recovered_tool_results.append(
+                (file_idx, _filter_sibling_tool_results(rec, answered_tool_use_ids))
+            )
 
         if not recovered_assistants and not recovered_tool_results:
             return [rec for _, rec in chain]

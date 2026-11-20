@@ -475,6 +475,56 @@ class TestSessionImporterCLI(unittest.TestCase):
                 self.assertEqual(code, 0, msg=f"args={text_args} err={err}")
                 self.assertTrue(out.strip())
 
+    def test_cli_internal_value_error_exits_1_and_startup_failure_emits_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "mock-repo"
+            repo_dir.mkdir()
+            registry = ProviderRegistry()
+            registry.register(_CustomMockProvider(cwd=str(repo_dir)))
+
+            # Unexpected internal ValueError from downstream logic must exit 1, not 2
+            with mock.patch.object(
+                session_importer,
+                "list_sessions",
+                side_effect=ValueError("internal parser bug"),
+            ):
+                code, out, _ = _run_main(["list", "--all-cwds", "--json"], registry=registry)
+            self.assertEqual(code, 1)
+            self.assertIn("internal parser bug", json.loads(out)["error"])
+
+            with mock.patch.object(
+                session_importer,
+                "render_show_envelope",
+                side_effect=ValueError("unexpected render bug"),
+            ):
+                code, out, _ = _run_main(
+                    ["show", "cursor-sess-0001", "--cwd", str(repo_dir), "--json"],
+                    registry=registry,
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("unexpected render bug", json.loads(out)["error"])
+
+            # Startup errors inside create_default_registry / build_parser must respect --json
+            with mock.patch.object(
+                session_importer,
+                "create_default_registry",
+                side_effect=RuntimeError("registry init failed"),
+            ):
+                code, out, err = _run_main(["list", "--json"])
+            self.assertEqual(code, 1)
+            self.assertEqual(err, "")
+            self.assertIn("registry init failed", json.loads(out)["error"])
+
+            with mock.patch.object(
+                session_importer,
+                "build_parser",
+                side_effect=ValueError("parser init failed"),
+            ):
+                code, out, err = _run_main(["providers", "--json"], registry=registry)
+            self.assertEqual(code, 1)
+            self.assertEqual(err, "")
+            self.assertIn("parser init failed", json.loads(out)["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

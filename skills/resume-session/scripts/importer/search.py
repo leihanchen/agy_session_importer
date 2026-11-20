@@ -260,7 +260,13 @@ def _prepare_field(text: str) -> tuple[str, set[str]]:
     return lowered, word_tokens
 
 
-def _field_matches_token(lowered: str, word_tokens: set[str], token: str) -> bool:
+def _field_matches_token(
+    lowered: str,
+    word_tokens: set[str],
+    token: str,
+    *,
+    allow_substring: bool = True,
+) -> bool:
     if not lowered:
         return False
     if _CJK_RE.search(token):
@@ -270,7 +276,9 @@ def _field_matches_token(lowered: str, word_tokens: set[str], token: str) -> boo
     if len(token) == 3:
         return any(wt.startswith(token) for wt in word_tokens)
     if len(token) >= 4:
-        return token in lowered
+        if allow_substring:
+            return token in lowered
+        return any(wt.startswith(token) for wt in word_tokens)
     return False
 
 
@@ -408,7 +416,9 @@ def _score_stage_b(
             continue
         lowered, word_tokens = _prepare_field(body_text)
         matched_count = sum(
-            1 for tok in tokens if _field_matches_token(lowered, word_tokens, tok)
+            1
+            for tok in tokens
+            if _field_matches_token(lowered, word_tokens, tok, allow_substring=False)
         )
         if matched_count > 0:
             multiplier = _SAME_REPO_MULTIPLIER if item.in_current_repo else 1.0

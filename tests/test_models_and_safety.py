@@ -185,6 +185,27 @@ class TestModelsAndSafety(unittest.TestCase):
         self.assertEqual(unchanged, "hello")
         self.assertFalse(not_truncated)
 
+    def test_redact_secrets_bearer_and_key_value_do_not_cross_newlines(self):
+        raw = (
+            "Authorization: Bearer\n"
+            "next_line_word\n"
+            "API_KEY=\n"
+            "next_line_value\n"
+            "DB_PASSWORD:  \n"
+            "third_line_value\n"
+        )
+        cleaned, count = redact_secrets(raw)
+        self.assertEqual(count, 0)
+        self.assertEqual(cleaned, raw)
+
+        same_line = "Authorization: Bearer \tmy_tok.123\nAPI_KEY =\tsecret_val_99\n"
+        redacted, same_count = redact_secrets(same_line)
+        self.assertEqual(same_count, 2)
+        self.assertIn("Bearer [REDACTED]", redacted)
+        self.assertIn("API_KEY=[REDACTED]", redacted)
+        self.assertNotIn("my_tok.123", redacted)
+        self.assertNotIn("secret_val_99", redacted)
+
 
 if __name__ == "__main__":
     unittest.main()

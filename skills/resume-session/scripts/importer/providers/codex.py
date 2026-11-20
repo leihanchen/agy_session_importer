@@ -471,21 +471,60 @@ def _qualify_tool_name(name: str, namespace: str) -> str:
     return clean_name
 
 
+def _parse_rollback_num_turns(payload: dict[str, Any]) -> tuple[int, bool]:
+    """Parse thread_rolled_back num_turns safely, returning (count, is_valid)."""
+    raw = payload.get("num_turns")
+    if raw is None or raw == "":
+        raw = payload.get("numTurns")
+    if raw is None or raw == "":
+        return 0, True
+    if isinstance(raw, bool):
+        return 0, False
+    if isinstance(raw, float):
+        if not raw.is_integer():
+            return 0, False
+        num = int(raw)
+    elif isinstance(raw, int):
+        num = raw
+    elif isinstance(raw, str):
+        try:
+            num = int(raw.strip())
+        except ValueError:
+            return 0, False
+    else:
+        return 0, False
+    if num <= 0:
+        return 0, num == 0
+    return num, True
+
+
+def _clean_index_title(index_entry: dict[str, Any], secret_counter: list[int]) -> str:
+    """Clean/truncate a session_index title and propagate any stored redaction count."""
+    raw = index_entry.get("title", "")
+    if not raw:
+        return ""
+    title = _preview_line(raw, _TITLE_PREVIEW_LIMIT, secret_counter)
+    if title:
+        secret_counter[0] += int(index_entry.get("title_secrets", 0) or 0)
+    return title
+
+
 def _merge_index_metadata(
     raw_title: str,
     updated_at: str,
     first_prompt: str,
-    index_entry: dict[str, str],
+    index_entry: dict[str, Any],
     secret_counter: list[int],
 ) -> tuple[str, str]:
     merged_updated = updated_at
-    idx_updated = index_entry.get("updated_at", "")
+    idx_updated = str(index_entry.get("updated_at", "") or "")
     if idx_updated and timestamp_to_epoch_ms(idx_updated) > timestamp_to_epoch_ms(merged_updated):
         merged_updated = idx_updated
-    chosen_title = raw_title.strip() or index_entry.get("title", "")
-    title = _preview_line(chosen_title, _TITLE_PREVIEW_LIMIT, secret_counter) or _preview_line(
-        first_prompt, _TITLE_PREVIEW_LIMIT, secret_counter
-    )
+    title = _preview_line(raw_title, _TITLE_PREVIEW_LIMIT, secret_counter) if raw_title.strip() else ""
+    if not title:
+        title = _clean_index_title(index_entry, secret_counter)
+    if not title:
+        title = _preview_line(first_prompt, _TITLE_PREVIEW_LIMIT, secret_counter)
     return title, merged_updated
 
 
@@ -516,7 +555,7 @@ class _TurnAccumulator:
         return turn
 
     def active_turn(self, ts: str, turn_id: str) -> NormalizedTurn:
-        if not self.turns:
+        if not self.turns or self.pending_compaction:
             return self.new_turn(ts, turn_id)
         if turn_id and self.turn_ids[-1] and turn_id != self.turn_ids[-1]:
             return self.new_turn(ts, turn_id)
@@ -542,6 +581,9 @@ class _TurnAccumulator:
                 turn.timestamp = ts
             if turn_id and not self.turn_ids[-1]:
                 self.turn_ids[-1] = turn_id
+            if self.pending_compaction:
+                turn.compaction_before = True
+                self.pending_compaction = False
         else:
             turn = self.new_turn(ts, turn_id)
             turn.user_text = cleaned
@@ -645,9 +687,9 @@ class CodexProvider(SessionProvider):
             return False
         return False
 
-    def _read_session_index(self, warnings: list[str]) -> dict[str, dict[str, str]]:
+    def _read_session_index(self, warnings: list[str]) -> dict[str, dict[str, Any]]:
         index_path = self.root / "session_index.jsonl"
-        entries: dict[str, dict[str, str]] = {}
+        entries: dict[str, dict[str, Any]] = {}
         if not index_path.is_file():
             return entries
         malformed = 0
@@ -668,12 +710,17 @@ class CodexProvider(SessionProvider):
                     sid = str(obj.get("id") or obj.get("session_id") or "").strip()
                     if not sid:
                         continue
-                    title = str(obj.get("thread_name") or obj.get("title") or obj.get("name") or "").strip()
+                    raw_title = obj.get("thread_name") or obj.get("title") or obj.get("name") or ""
+                    title_secrets = [0]
+                    title = _preview_line(raw_title, _TITLE_PREVIEW_LIMIT, title_secrets)
                     updated = normalize_timestamp(obj.get("updated_at"))
                     prev = entries.get(sid, {})
                     entries[sid] = {
-                        "title": title or prev.get("title", ""),
-                        "updated_at": updated or prev.get("updated_at", ""),
+                        "title": title or str(prev.get("title", "")),
+                        "updated_at": updated or str(prev.get("updated_at", "")),
+                        "title_secrets": (
+                            title_secrets[0] if title else int(prev.get("title_secrets", 0) or 0)
+                        ),
                     }
         except OSError as exc:
             _add_unique(warnings, f"codex_session_index_error:{exc}")
@@ -922,8 +969,13 @@ class CodexProvider(SessionProvider):
                         if prev:
                             legacy_prompts.append(prev)
                     elif etype == "thread_rolled_back":
-                        num = int(payload.get("num_turns") or payload.get("numTurns") or 0)
-                        if num > 0:
+                        num, valid = _parse_rollback_num_turns(payload)
+                        if not valid:
+                            msg = "codex_invalid_rollback_turns"
+                            _add_unique(file_warnings, msg)
+                            if warnings is not None:
+                                _add_unique(warnings, msg)
+                        elif num > 0:
                             del response_prompts[-num:]
                             del legacy_prompts[-num:]
 
@@ -992,10 +1044,11 @@ class CodexProvider(SessionProvider):
         hist_info: dict[str, Any] | None,
         state_db: Path | None,
         history_db: Path | None,
-        index_entry: dict[str, str],
+        index_entry: dict[str, Any],
         archived_flag: bool,
         secret_counter: list[int],
         history_checked: bool = True,
+        title_secret_counter: list[int] | None = None,
     ) -> SessionSummary:
         cwd = normalize_path(
             str(row.get("cwd") or (rollout_scan["cwd"] if rollout_scan else "") or "")
@@ -1040,16 +1093,18 @@ class CodexProvider(SessionProvider):
             or (hist_info["last_prompt"] if hist_info and hist_info["last_prompt"] else "")
             or first_prompt
         )
-        turn_count = (
-            rollout_scan["turn_count"]
-            if rollout_scan is not None
-            else (hist_info["turn_count"] if hist_info else (1 if first_prompt else 0))
-        )
+        rollout_turns = rollout_scan["turn_count"] if rollout_scan is not None else 0
+        hist_turns = hist_info["turn_count"] if hist_info else 0
+        turn_count = rollout_turns or hist_turns or (1 if first_prompt else 0)
 
         raw_title = str(row.get("name") or "").strip() or str(row.get("title") or "").strip()
+        title_sc = [0]
         title, updated_at = _merge_index_metadata(
-            raw_title, updated_at, first_prompt, index_entry, secret_counter
+            raw_title, updated_at, first_prompt, index_entry, title_sc
         )
+        secret_counter[0] += title_sc[0]
+        if title_secret_counter is not None:
+            title_secret_counter[0] += title_sc[0]
 
         return SessionSummary(
             provider=self.name,
@@ -1212,6 +1267,8 @@ class CodexProvider(SessionProvider):
         base_summary: SessionSummary | None,
         *,
         max_tool_chars: int,
+        index_entries: dict[str, dict[str, Any]] | None = None,
+        base_title_secrets: int = 0,
     ) -> tuple[SessionDetail, bool]:
         warnings: list[str] = list(base_summary.warnings) if base_summary else []
         lines = _iter_rollout_lines(path, warnings)
@@ -1440,9 +1497,19 @@ class CodexProvider(SessionProvider):
                         _add_unique(target_turn.warnings, f"turn_aborted:{reason}" if reason else "turn_aborted")
                     _add_unique(warnings, "turn_aborted")
                 elif etype == "thread_rolled_back":
-                    num = int(payload.get("num_turns") or payload.get("numTurns") or 0)
-                    if acc.rollback(num):
+                    num, valid = _parse_rollback_num_turns(payload)
+                    if not valid:
+                        _add_unique(warnings, "codex_invalid_rollback_turns")
+                    elif acc.rollback(num):
                         _add_unique(warnings, "thread_rolled_back")
+
+        secret_counter[0] += base_title_secrets
+        resolved_sid = meta_session_id or (base_summary.session_id if base_summary else str(path.resolve()))
+        title_override = ""
+        if base_summary is not None and base_summary.title:
+            title_override = _preview_line(base_summary.title, _TITLE_PREVIEW_LIMIT, secret_counter)
+        elif index_entries and resolved_sid in index_entries:
+            title_override = _clean_index_title(index_entries[resolved_sid], secret_counter)
 
         detail = self._finalize_detail(
             turns=acc.turns,
@@ -1451,13 +1518,14 @@ class CodexProvider(SessionProvider):
             secret_counter=secret_counter,
             warnings=warnings,
             base_summary=base_summary,
-            session_id=meta_session_id or (base_summary.session_id if base_summary else str(path.resolve())),
+            session_id=resolved_sid,
             source_kind="rollout_jsonl",
             source_path=str(path.resolve()),
             cwd=meta_cwd or (base_summary.cwd if base_summary else ""),
             git_branch=meta_branch or (base_summary.git_branch if base_summary else ""),
             created_at=created_at or (base_summary.created_at if base_summary else ""),
             updated_at=updated_at or (base_summary.updated_at if base_summary else ""),
+            title_override=title_override,
         )
         return detail, True
 
@@ -1468,6 +1536,7 @@ class CodexProvider(SessionProvider):
         *,
         max_tool_chars: int,
         warnings: list[str],
+        base_title_secrets: int = 0,
     ) -> SessionDetail | None:
         history_db = self._find_history_db()
         if history_db is None:
@@ -1491,8 +1560,10 @@ class CodexProvider(SessionProvider):
 
             turn_meta: dict[str, dict[str, Any]] = {}
             if "thread_turns" in tables:
+                turn_cols = {r[1] for r in conn.execute("PRAGMA table_info(thread_turns)").fetchall()}
+                turn_order = " ORDER BY rollout_ordinal" if "rollout_ordinal" in turn_cols else ""
                 for row in conn.execute(
-                    "SELECT * FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal",
+                    f"SELECT * FROM thread_turns WHERE thread_id = ?{turn_order}",
                     (thread_id,),
                 ).fetchall():
                     d = dict(row)
@@ -1516,7 +1587,7 @@ class CodexProvider(SessionProvider):
         if not item_rows:
             return None
 
-        secret_counter = [0]
+        secret_counter = [base_title_secrets]
         compaction_count = 0
         malformed = 0
 
@@ -1802,6 +1873,7 @@ class CodexProvider(SessionProvider):
         git_branch: str,
         created_at: str,
         updated_at: str,
+        title_override: str = "",
     ) -> SessionDetail:
         files_mentioned: list[str] = []
         commands_run: list[str] = []
@@ -1823,9 +1895,6 @@ class CodexProvider(SessionProvider):
                 for cmd in turn_commands[idx - 1]:
                     _add_unique(commands_run, cmd)
 
-        if secret_counter[0] > 0:
-            _add_unique(warnings, f"secrets_redacted:{secret_counter[0]}")
-
         first_prompt = (
             user_prompts[0]
             if user_prompts
@@ -1836,10 +1905,15 @@ class CodexProvider(SessionProvider):
             if user_prompts
             else (base_summary.last_user_prompt if base_summary else first_prompt)
         )
+        raw_base_title = title_override or (base_summary.title if base_summary and base_summary.title else "")
         title = (
-            (base_summary.title if base_summary and base_summary.title else "")
-            or truncate_text(first_prompt, _TITLE_PREVIEW_LIMIT, single_line=True)[0]
+            _preview_line(raw_base_title, _TITLE_PREVIEW_LIMIT, secret_counter)
+            if raw_base_title
+            else truncate_text(first_prompt, _TITLE_PREVIEW_LIMIT, single_line=True)[0]
         )
+
+        if secret_counter[0] > 0:
+            _add_unique(warnings, f"secrets_redacted:{secret_counter[0]}")
         summary = SessionSummary(
             provider=self.name,
             session_id=session_id,
@@ -1970,6 +2044,7 @@ class CodexProvider(SessionProvider):
             state_rows, _ = self._read_state_threads(warnings)
             index_entries = self._read_session_index(warnings)
             base_summary: SessionSummary | None = None
+            title_secrets = [0]
             if sid_hint and sid_hint in state_rows:
                 row = state_rows[sid_hint]
                 base_summary = self._summary_from_state_row(
@@ -1984,14 +2059,19 @@ class CodexProvider(SessionProvider):
                     archived_flag=bool(row.get("archived")),
                     secret_counter=[0],
                     history_checked=False,
+                    title_secret_counter=title_secrets,
                 )
             elif sid_hint and sid_hint in index_entries:
                 base_summary = self._empty_summary(target, source_kind="rollout_jsonl", warnings=[])
-                base_summary.title = index_entries[sid_hint].get("title", "")
+                base_summary.title = _clean_index_title(index_entries[sid_hint], title_secrets)
 
-            detail, ok = self._parse_rollout_detail(target, base_summary, max_tool_chars=max_tool_chars)
-            if base_summary is None and detail.summary.session_id in index_entries and not detail.summary.title:
-                detail.summary.title = index_entries[detail.summary.session_id].get("title", "")
+            detail, ok = self._parse_rollout_detail(
+                target,
+                base_summary,
+                max_tool_chars=max_tool_chars,
+                index_entries=index_entries,
+                base_title_secrets=title_secrets[0],
+            )
             if ok:
                 return detail
             lookup_sid = detail.summary.session_id or sid_hint
@@ -2002,9 +2082,14 @@ class CodexProvider(SessionProvider):
                     base_summary or detail.summary,
                     max_tool_chars=max_tool_chars,
                     warnings=merged_warnings,
+                    base_title_secrets=title_secrets[0],
                 )
                 if sql_detail is not None:
                     return sql_detail
+            if title_secrets[0] > 0:
+                secret_warn = f"secrets_redacted:{title_secrets[0]}"
+                _add_unique(detail.warnings, secret_warn)
+                _add_unique(detail.summary.warnings, secret_warn)
             return detail
 
         warnings = []

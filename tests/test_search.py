@@ -849,6 +849,73 @@ class TestSearchAndResolution(unittest.TestCase):
             self.assertEqual(explicit_res.candidates, [])
             self.assertTrue(any("codex_read_error:" in w for w in explicit_res.warnings))
 
+    def test_stage_b_body_search_avoids_inner_substring_false_positives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+
+            prov = MockSearchProvider(
+                "codex",
+                sessions=[
+                    _make_summary(
+                        provider="codex",
+                        session_id="sess-one",
+                        cwd=str(repo),
+                        title="Refactor module layout",
+                        first_user_prompt="Clean up dependencies",
+                        updated_at="2026-11-20T06:00:00Z",
+                    ),
+                    _make_summary(
+                        provider="codex",
+                        session_id="sess-two",
+                        cwd=str(repo),
+                        title="Fix server binding",
+                        first_user_prompt="Update config",
+                        updated_at="2026-11-20T05:00:00Z",
+                    ),
+                    _make_summary(
+                        provider="codex",
+                        session_id="sess-three",
+                        cwd=str(repo),
+                        title="Database notes",
+                        first_user_prompt="Check plan",
+                        updated_at="2026-11-20T04:00:00Z",
+                    ),
+                ],
+                bodies={
+                    "sess-one": "We use important transport and import statements everywhere.",
+                    "sess-two": "Bind service to port 8080 and expose portal route.",
+                    "sess-three": "讨论数据库迁移方案与回滚步骤",
+                },
+            )
+            reg = ProviderRegistry()
+            reg.register(prov)
+
+            # "port" must match only "sess-two" via word/prefix, not "sess-one" via "import"/"transport"
+            port_listed, _ = list_sessions(reg, cwd=str(repo), query="port")
+            self.assertEqual([s.session_id for s in port_listed], ["sess-two"])
+
+            port_res = resolve_session(reg, "port route", cwd=str(repo))
+            self.assertEqual(port_res.status, "matched")
+            self.assertEqual(port_res.reason, "body_match")
+            self.assertEqual(port_res.detail.summary.session_id, "sess-two")
+
+            # Verify "sess-one" alone does not match "port" in Stage B
+            import_only_reg = ProviderRegistry()
+            import_only_reg.register(
+                MockSearchProvider(
+                    "codex",
+                    sessions=[prov._sessions[0]],
+                    bodies={"sess-one": prov._bodies["sess-one"]},
+                )
+            )
+            no_port = resolve_session(import_only_reg, "port", cwd=str(repo))
+            self.assertEqual(no_port.status, "no_match")
+
+            # CJK substring matching in Stage B must remain intact
+            cjk_listed, _ = list_sessions(reg, cwd=str(repo), query="迁移")
+            self.assertEqual([s.session_id for s in cjk_listed], ["sess-three"])
+
 
 if __name__ == "__main__":
     unittest.main()

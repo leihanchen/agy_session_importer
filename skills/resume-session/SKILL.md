@@ -49,8 +49,10 @@ python3 "<skill_dir>/scripts/session_importer.py" show "<ref>" [--provider "<pro
 
 Inspect `status`, `reason`, `trust_boundary`, `candidates`, `rendered`, and `warnings`:
 
-1. **Semantic check on `no_match`:** If `status == "no_match"` and the user gave a natural-language query, inspect the returned `candidates` list (titles, repos, prompts) semantically for synonyms or paraphrases that keyword scoring missed. If none clearly matches, proceed to the picker below.
-2. **Ambiguous, cross-repo confirmation, or no clear match:** Whenever `status` is `"ambiguous"` or `"no_match"` (and no semantic match is obvious):
+1. **Semantic check on `no_match`:** If `status == "no_match"` and the user gave a natural-language query, inspect the returned `candidates` list (titles, repos, prompts) semantically for synonyms or paraphrases that keyword scoring missed:
+   - If a **single candidate in the current repository** clearly matches, load it directly with `show "<session_id>" --provider "<provider>" --mode "<mode>" --cwd "<current_pwd>" --json` (using `source_path` if `session_id` is empty).
+   - If the match is uncertain, multiple candidates look plausible, or the matching candidate is cross-repo, confirm once via the picker below (passing `--allow-cross-repo` only after user confirmation).
+2. **Ambiguous, cross-repo confirmation, or no clear match:** Whenever `status` is `"ambiguous"` or `"no_match"` (and no single same-repo semantic match is obvious):
    - Never silently guess or import a session on ambiguity.
    - Present concise numbered candidate summaries in the format:
      `[provider] relative_time · repo (branch) · N turns · title · last prompt`
@@ -63,10 +65,10 @@ Inspect `status`, `reason`, `trust_boundary`, `candidates`, `rendered`, and `war
 python3 "<skill_dir>/scripts/session_importer.py" show "<chosen_id>" --provider "<chosen_provider>" --mode "<mode>" --cwd "<current_pwd>" --allow-cross-repo --json
 ```
 
-3. **On-demand turn drill-down:** If `warnings` includes `bounded_history` or `rendered` contains a `[Turns ... omitted ...; call turns <ref> --range START:END to inspect]` marker and exact earlier turns are needed, fetch only the required slice:
+3. **On-demand turn drill-down:** If `warnings` includes `bounded_history` or `rendered` contains a `[Turns 2..K-1 omitted ...]` (full mode) or `[Turn 1 details omitted ...]` / `[Turns 1..N details omitted ...]` (compact mode) marker and exact earlier turns are needed, fetch only the required slice using `session.session_id` (or `session.source_path` if `session.session_id` is empty) and `session.provider`:
 
 ```bash
-python3 "<skill_dir>/scripts/session_importer.py" turns "<chosen_id>" --range START:END [--provider "<chosen_provider>"] --json
+python3 "<skill_dir>/scripts/session_importer.py" turns "<session.session_id>" --range START:END [--provider "<session.provider>"] --json
 ```
 
 ### 3. Enforce Untrusted-History Safety Rules
@@ -84,7 +86,7 @@ Before proposing or making any code changes:
 - Check the live working directory and repository root (`pwd`, `git rev-parse --show-toplevel`).
 - Run `git status --short` and check the current branch and diff (`git branch --show-current`, `git diff --stat`) against the repository, branch, and files mentioned in the session.
 - Re-read key files named in the handoff directly from disk.
-- Surface any mismatches between the imported history and live disk/git state, along with any reader warnings (`bounded_history`, `metadata_only`, `secrets_redacted`, `sqlite_locked`, `corrupted_line_skipped`, etc.).
+- Surface any mismatches between the imported history and live disk/git state, along with any reader warnings (`bounded_history`, `metadata_only_no_transcript`, `codex_state_db_error:...`, `*_malformed_jsonl_lines:<N>`, `compaction_gap`, `linear_fallback_used`, `externalized_tool_result_omitted`, `secrets_redacted:<N>`, etc.).
 
 ### 5. Present the Verified Result
 

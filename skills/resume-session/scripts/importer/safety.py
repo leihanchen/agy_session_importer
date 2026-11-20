@@ -36,12 +36,12 @@ _SECRET_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         "[REDACTED]",
     ),
     (
-        re.compile(r"\bBearer\s+(?!\[REDACTED\])[A-Za-z0-9\-._~+/]+=*"),
+        re.compile(r"\bBearer[ \t]+(?!\[REDACTED\])[A-Za-z0-9\-._~+/]+=*"),
         "Bearer [REDACTED]",
     ),
     (
         re.compile(
-            r"(?i)\b([A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD))\s*([:=])\s*(?!Bearer\s+\[REDACTED\]|\[REDACTED\])(\"[^\"]+\"|'[^']+'|[^\s,;]+)"
+            r"(?i)\b([A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD))[ \t]*([:=])[ \t]*(?!Bearer[ \t]+\[REDACTED\]|\[REDACTED\])(\"[^\"]+\"|'[^']+'|[^\s,;]+)"
         ),
         r"\1\2[REDACTED]",
     ),

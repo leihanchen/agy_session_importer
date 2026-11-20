@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _SCRIPTS_DIR = str(Path(__file__).resolve().parents[1] / "skills" / "resume-session" / "scripts")
 if _SCRIPTS_DIR not in sys.path:
@@ -229,6 +230,26 @@ class TestProviderRegistryAndUtilities(unittest.TestCase):
 
             with self.assertRaises(ProviderReadError):
                 open_sqlite_readonly(Path(tmp) / "does_not_exist.sqlite")
+
+    def test_open_sqlite_readonly_wraps_resolve_and_is_file_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            loop_a = base / "loop_a.sqlite"
+            loop_b = base / "loop_b.sqlite"
+            os.symlink(loop_b, loop_a)
+            os.symlink(loop_a, loop_b)
+
+            with self.assertRaises(ProviderReadError):
+                open_sqlite_readonly(loop_a)
+
+            for exc in (OSError("permission denied"), RuntimeError("symlink loop"), ValueError("bad path")):
+                with mock.patch.object(Path, "resolve", side_effect=exc):
+                    with self.assertRaises(ProviderReadError):
+                        open_sqlite_readonly(base / "any.sqlite")
+
+            with mock.patch.object(Path, "is_file", side_effect=OSError("stat failed")):
+                with self.assertRaises(ProviderReadError):
+                    open_sqlite_readonly(base / "any.sqlite")
 
 
 if __name__ == "__main__":

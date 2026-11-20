@@ -15,7 +15,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 from importer.models import normalize_timestamp
-from importer.providers.codex import CodexProvider
+from importer.providers.codex import CodexProvider, _TurnAccumulator
 from importer.providers.registry import create_default_registry
 
 
@@ -902,6 +902,279 @@ class TestCodexProvider(unittest.TestCase):
                 bad_detail = provider.load_session("custom-no-uuid-id")
                 self.assertTrue(any("malformed" in w for w in bad_detail.warnings))
                 self.assertFalse(any("zstd" in w for w in bad_detail.warnings))
+
+    def test_codex_explicit_rollout_path_sanitizes_session_index_title_and_counts_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex_home"
+            sid_uuid = "019a0000-bbbb-7000-8000-000000000001"
+            sid_custom = "custom-rollout-id-001"
+
+            uuid_rollout = root / "sessions" / f"rollout-{sid_uuid}.jsonl"
+            _write_jsonl(
+                uuid_rollout,
+                [
+                    {"timestamp": "2026-11-20T10:00:00Z", "type": "session_meta", "payload": {"id": sid_uuid, "cwd": tmp}},
+                    {"timestamp": "2026-11-20T10:00:01Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Clean user prompt"}]}},
+                ],
+            )
+            custom_rollout = root / "sessions" / "rollout-custom-no-uuid.jsonl"
+            _write_jsonl(
+                custom_rollout,
+                [
+                    {"timestamp": "2026-11-20T10:05:00Z", "type": "session_meta", "payload": {"id": sid_custom, "cwd": tmp}},
+                    {"timestamp": "2026-11-20T10:05:01Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Custom rollout turn"}]}},
+                ],
+            )
+
+            long_tail = "x" * 140
+            raw_title = (
+                "<system-reminder>injected</system-reminder>"
+                f"Fix\x07 auth token sk-proj-abc1234567890xyz {long_tail}"
+            )
+            _write_jsonl(
+                root / "session_index.jsonl",
+                [
+                    {"id": sid_uuid, "thread_name": raw_title, "updated_at": "2026-11-20T10:01:00Z"},
+                    {"id": sid_custom, "thread_name": "<environment_context>bad</environment_context>Bearer\tsecrettok123", "updated_at": "2026-11-20T10:06:00Z"},
+                ],
+            )
+
+            provider = CodexProvider(root=root)
+
+            # _read_session_index itself must not store raw unsanitized secrets/wrappers/control chars
+            idx_warnings: list[str] = []
+            idx_entries = provider._read_session_index(idx_warnings)
+            self.assertEqual(idx_warnings, [])
+            self.assertNotIn("sk-proj-", idx_entries[sid_uuid]["title"])
+            self.assertNotIn("<system-reminder>", idx_entries[sid_uuid]["title"])
+            self.assertNotIn("\x07", idx_entries[sid_uuid]["title"])
+
+            # Explicit rollout load with UUID filename (sid_hint in index_entries)
+            detail_uuid = provider.load_session(str(uuid_rollout))
+            self.assertNotIn("sk-proj-", detail_uuid.summary.title)
+            self.assertNotIn("<system-reminder>", detail_uuid.summary.title)
+            self.assertNotIn("\x07", detail_uuid.summary.title)
+            self.assertIn("\ufffd", detail_uuid.summary.title)
+            self.assertIn("[REDACTED]", detail_uuid.summary.title)
+            self.assertLessEqual(len(detail_uuid.summary.title), 123)
+            self.assertIn("secrets_redacted:1", detail_uuid.warnings)
+            self.assertIn("secrets_redacted:1", detail_uuid.summary.warnings)
+
+            # Explicit rollout load with UUID-less filename (base_summary is None; resolved via session_meta.id)
+            detail_custom = provider.load_session(str(custom_rollout))
+            self.assertEqual(detail_custom.summary.title, "Bearer [REDACTED]")
+            self.assertIn("secrets_redacted:1", detail_custom.warnings)
+            self.assertIn("secrets_redacted:1", detail_custom.summary.warnings)
+
+    def test_codex_malformed_thread_rolled_back_num_turns_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex_home"
+            sid = "019a0000-cccc-7000-8000-000000000001"
+            rollout = root / "sessions" / f"rollout-{sid}.jsonl"
+            _write_jsonl(
+                rollout,
+                [
+                    {"timestamp": "2026-11-20T10:00:00Z", "type": "session_meta", "payload": {"id": sid, "cwd": tmp}},
+                    {"timestamp": "2026-11-20T10:00:01Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Keep turn 1"}]}},
+                    {"timestamp": "2026-11-20T10:00:02Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Reply 1"}]}},
+                    {"timestamp": "2026-11-20T10:00:03Z", "type": "event_msg", "payload": {"type": "thread_rolled_back", "num_turns": "not-an-int"}},
+                    {"timestamp": "2026-11-20T10:00:04Z", "type": "event_msg", "payload": {"type": "thread_rolled_back", "num_turns": {"bad": 1}}},
+                    {"timestamp": "2026-11-20T10:00:05Z", "type": "event_msg", "payload": {"type": "thread_rolled_back", "num_turns": True}},
+                    {"timestamp": "2026-11-20T10:00:06Z", "type": "event_msg", "payload": {"type": "thread_rolled_back", "num_turns": -2}},
+                ],
+            )
+
+            provider = CodexProvider(root=root)
+            summaries, list_warnings = provider.list_sessions()
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0].turn_count, 1)
+            self.assertIn("codex_invalid_rollback_turns", summaries[0].warnings)
+            self.assertIn("codex_invalid_rollback_turns", list_warnings)
+
+            detail = provider.load_session(sid)
+            self.assertEqual(len(detail.turns), 1)
+            self.assertEqual(detail.turns[0].user_text, "Keep turn 1")
+            self.assertIn("codex_invalid_rollback_turns", detail.warnings)
+
+    def test_codex_sqlite_history_thread_turns_without_rollout_ordinal_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex_home"
+            root.mkdir(parents=True)
+            sid = "019a0000-dddd-7000-8000-000000000001"
+            missing_rollout = root / "sessions" / f"rollout-{sid}.jsonl"
+
+            _create_state_db(
+                root / "state_1.sqlite",
+                [
+                    {
+                        "id": sid,
+                        "rollout_path": str(missing_rollout),
+                        "created_at": 1776916000,
+                        "updated_at": 1776916010,
+                        "cwd": tmp,
+                        "title": "Legacy thread_turns schema",
+                    }
+                ],
+            )
+
+            hist_db = root / "thread_history_1.sqlite"
+            conn = sqlite3.connect(str(hist_db))
+            conn.execute(
+                """
+                CREATE TABLE thread_turns (
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error_json TEXT,
+                    started_at INTEGER,
+                    completed_at INTEGER,
+                    PRIMARY KEY (thread_id, turn_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE thread_items (
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    rollout_ordinal INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    item_type TEXT NOT NULL DEFAULT '',
+                    item_json TEXT NOT NULL,
+                    PRIMARY KEY (thread_id, turn_id, item_id)
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO thread_turns (thread_id, turn_id, status, started_at, completed_at) VALUES (?, ?, ?, ?, ?)",
+                (sid, "turn-1", "aborted", 1776916000, 1776916005),
+            )
+            conn.execute(
+                "INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_type, item_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sid, "turn-1", "item-1", 0, 1776916001000, "userMessage", json.dumps({"type": "userMessage", "content": [{"type": "text", "text": "Recover from sqlite"}]})),
+            )
+            conn.execute(
+                "INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_type, item_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sid, "turn-1", "item-2", 1, 1776916003000, "agentMessage", json.dumps({"type": "agentMessage", "text": "Partial sqlite reply"})),
+            )
+            conn.commit()
+            conn.close()
+
+            provider = CodexProvider(root=root)
+            detail = provider.load_session(sid)
+            self.assertEqual(detail.summary.source_kind, "sqlite_history")
+            self.assertFalse(any("codex_history_db_error" in w for w in detail.warnings))
+            self.assertEqual(len(detail.turns), 1)
+            self.assertEqual(detail.turns[0].user_text, "Recover from sqlite")
+            self.assertEqual(detail.turns[0].assistant_text, "Partial sqlite reply")
+            self.assertIn("turn_aborted", detail.turns[0].warnings)
+
+    def test_codex_post_compaction_assistant_continuation_starts_new_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex_home"
+            sid = "019a0000-eeee-7000-8000-000000000001"
+            rollout = root / "sessions" / f"rollout-{sid}.jsonl"
+            _write_jsonl(
+                rollout,
+                [
+                    {"timestamp": "2026-11-20T11:00:00Z", "type": "session_meta", "payload": {"id": sid, "cwd": tmp}},
+                    {
+                        "timestamp": "2026-11-20T11:01:00Z",
+                        "type": "compacted",
+                        "payload": {
+                            "replacement_history": [
+                                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Turn 1 pre-compaction"}]},
+                                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Turn 1 reply."}]},
+                            ]
+                        },
+                    },
+                    # Assistant resumes directly after compaction with NO user turn and no new turn_id
+                    {
+                        "timestamp": "2026-11-20T11:01:10Z",
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Post-compaction continuation."}]},
+                    },
+                    # Subsequent user turn must not inherit compaction_before
+                    {
+                        "timestamp": "2026-11-20T11:02:00Z",
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Turn 3 user prompt"}]},
+                    },
+                    {
+                        "timestamp": "2026-11-20T11:02:05Z",
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Turn 3 reply."}]},
+                    },
+                ],
+            )
+
+            provider = CodexProvider(root=root)
+            detail = provider.load_session(sid)
+            self.assertEqual(len(detail.turns), 3)
+            self.assertEqual(detail.compaction_count, 1)
+            self.assertIn("compaction_gap", detail.warnings)
+
+            self.assertEqual(detail.turns[0].user_text, "Turn 1 pre-compaction")
+            self.assertEqual(detail.turns[0].assistant_text, "Turn 1 reply.")
+            self.assertFalse(detail.turns[0].compaction_before)
+
+            self.assertEqual(detail.turns[1].user_text, "")
+            self.assertEqual(detail.turns[1].assistant_text, "Post-compaction continuation.")
+            self.assertTrue(detail.turns[1].compaction_before)
+
+            self.assertEqual(detail.turns[2].user_text, "Turn 3 user prompt")
+            self.assertEqual(detail.turns[2].assistant_text, "Turn 3 reply.")
+            self.assertFalse(detail.turns[2].compaction_before)
+
+            # Empty trailing turn also propagates pending_compaction when populated by add_user_message
+            acc = _TurnAccumulator()
+            acc.new_turn("2026-11-20T12:00:00Z", "t1")
+            acc.pending_compaction = True
+            acc.add_user_message("Populated after compaction", "2026-11-20T12:00:05Z", "t1")
+            self.assertEqual(len(acc.turns), 1)
+            self.assertTrue(acc.turns[0].compaction_before)
+            self.assertFalse(acc.pending_compaction)
+
+    def test_codex_corrupt_rollout_turn_count_falls_back_to_history_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex_home"
+            sid = "019a0000-ffff-7000-8000-000000000001"
+            corrupt_rollout = root / "sessions" / f"rollout-{sid}.jsonl"
+            corrupt_rollout.parent.mkdir(parents=True, exist_ok=True)
+            corrupt_rollout.write_text("{corrupt line\n", encoding="utf-8")
+
+            _create_state_db(
+                root / "state_1.sqlite",
+                [
+                    {
+                        "id": sid,
+                        "rollout_path": str(corrupt_rollout),
+                        "created_at": 1776916000,
+                        "updated_at": 1776916020,
+                        "cwd": tmp,
+                        "title": "Corrupt rollout with sqlite turns",
+                    }
+                ],
+            )
+            _create_history_db(
+                root / "thread_history_1.sqlite",
+                turns=[
+                    (sid, "t1", 0, "completed", 1776916000, 1776916010),
+                    (sid, "t2", 1, "completed", 1776916011, 1776916020),
+                ],
+                items=[
+                    (sid, "t1", "i1", 0, 1776916001000, "userMessage", {"type": "userMessage", "content": [{"type": "text", "text": "SQLite prompt 1"}]}),
+                    (sid, "t2", "i2", 1, 1776916012000, "userMessage", {"type": "userMessage", "content": [{"type": "text", "text": "SQLite prompt 2"}]}),
+                ],
+            )
+
+            provider = CodexProvider(root=root)
+            summaries, _ = provider.list_sessions()
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0].turn_count, 2)
+            self.assertEqual(summaries[0].first_user_prompt, "SQLite prompt 1")
+            self.assertEqual(summaries[0].last_user_prompt, "SQLite prompt 2")
 
 
 if __name__ == "__main__":
