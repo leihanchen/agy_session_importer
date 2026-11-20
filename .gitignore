@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs & temporary files
+*.log
+tmp/
+
+# Worktrees, SDD workspace, and Python artifacts
+.worktrees/
+.superpowers/
+__pycache__/
+*.pyc
+.pytest_cache/
