@@ -923,7 +923,13 @@ class ClaudeProvider(SessionProvider):
             if head_u and head_u != uid and head_u in nodes_by_uuid:
                 if nodes_by_uuid[head_u][0] > file_idx:
                     preserved_overrides.setdefault(head_u, uid)
-                elif anchor_u and anchor_u != head_u and anchor_u in nodes_by_uuid:
+                elif (
+                    anchor_u
+                    and anchor_u != uid
+                    and anchor_u != head_u
+                    and anchor_u in nodes_by_uuid
+                    and nodes_by_uuid[anchor_u][0] < nodes_by_uuid[head_u][0]
+                ):
                     preserved_overrides.setdefault(head_u, anchor_u)
 
         if sidechain_skipped:
@@ -1212,9 +1218,9 @@ class ClaudeProvider(SessionProvider):
 
         def _ensure_active_turn(ts: str) -> NormalizedTurn:
             nonlocal pending_compaction, saw_boundary_for_pending
-            if not turns:
+            if not turns or pending_compaction:
                 t = NormalizedTurn(
-                    turn_index=1,
+                    turn_index=len(turns) + 1,
                     timestamp=ts,
                     user_text="",
                     assistant_text="",

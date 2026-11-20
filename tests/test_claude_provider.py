@@ -894,6 +894,172 @@ class TestClaudeProvider(unittest.TestCase):
             self.assertTrue(detail.turns[2].compaction_before)
             self.assertIn("compaction_gap", detail.warnings)
 
+    def test_claude_compaction_followed_directly_by_assistant_continuation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "claude_home"
+            sid = "12121212-1212-4121-8121-121212121212"
+            jsonl = root / "projects" / "-tmp-cont" / f"{sid}.jsonl"
+
+            _write_jsonl(
+                jsonl,
+                [
+                    {
+                        "type": "user",
+                        "uuid": "u1",
+                        "parentUuid": None,
+                        "sessionId": sid,
+                        "cwd": tmp,
+                        "timestamp": "2026-11-20T14:00:00Z",
+                        "message": {"role": "user", "content": "Turn 1 before compaction"},
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "a1",
+                        "parentUuid": "u1",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T14:00:05Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Pre-compaction reply."}]},
+                    },
+                    {
+                        "type": "system",
+                        "subtype": "compact_boundary",
+                        "uuid": "cb1",
+                        "parentUuid": None,
+                        "logicalParentUuid": "a1",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T14:01:00Z",
+                    },
+                    {
+                        "type": "user",
+                        "uuid": "cs1",
+                        "parentUuid": "cb1",
+                        "isCompactSummary": True,
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T14:01:01Z",
+                        "message": {"role": "user", "content": "Synthetic compaction summary"},
+                    },
+                    # Assistant resumes directly after compaction with NO intervening user turn
+                    {
+                        "type": "assistant",
+                        "uuid": "a2",
+                        "parentUuid": "cs1",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T14:01:10Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Resuming task directly."}]},
+                    },
+                    # Subsequent user turn must NOT steal compaction_before from the post-compaction assistant turn
+                    {
+                        "type": "user",
+                        "uuid": "u2",
+                        "parentUuid": "a2",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T14:02:00Z",
+                        "message": {"role": "user", "content": "Turn 3 user followup"},
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "a3",
+                        "parentUuid": "u2",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T14:02:05Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Followup reply."}]},
+                    },
+                    {"type": "last-prompt", "lastPrompt": "Turn 3 user followup", "leafUuid": "a3", "sessionId": sid},
+                ],
+            )
+
+            provider = ClaudeProvider(root=root)
+            detail = provider.load_session(sid)
+
+            self.assertEqual(len(detail.turns), 3)
+            self.assertEqual(detail.compaction_count, 1)
+            self.assertIn("compaction_gap", detail.warnings)
+
+            self.assertEqual(detail.turns[0].user_text, "Turn 1 before compaction")
+            self.assertFalse(detail.turns[0].compaction_before)
+
+            self.assertEqual(detail.turns[1].user_text, "")
+            self.assertEqual(detail.turns[1].assistant_text, "Resuming task directly.")
+            self.assertTrue(detail.turns[1].compaction_before)
+
+            self.assertEqual(detail.turns[2].user_text, "Turn 3 user followup")
+            self.assertEqual(detail.turns[2].assistant_text, "Followup reply.")
+            self.assertFalse(detail.turns[2].compaction_before)
+
+    def test_claude_preboundary_preserved_segment_anchor_self_does_not_cycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "claude_home"
+            sid = "34343434-3434-4343-8343-343434343434"
+            jsonl = root / "projects" / "-tmp-pres-cycle" / f"{sid}.jsonl"
+
+            _write_jsonl(
+                jsonl,
+                [
+                    {
+                        "type": "user",
+                        "uuid": "pres-head",
+                        "parentUuid": None,
+                        "sessionId": sid,
+                        "cwd": tmp,
+                        "timestamp": "2026-11-20T15:00:00Z",
+                        "message": {"role": "user", "content": "Pre-boundary preserved head"},
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "pres-tail",
+                        "parentUuid": "pres-head",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T15:00:05Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Pre-boundary preserved tail."}]},
+                    },
+                    {
+                        "type": "system",
+                        "subtype": "compact_boundary",
+                        "uuid": "cb-self",
+                        "parentUuid": None,
+                        "logicalParentUuid": None,
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T15:01:00Z",
+                        "compactMetadata": {
+                            "preservedSegment": {
+                                "headUuid": "pres-head",
+                                "anchorUuid": "cb-self",
+                                "tailUuid": "pres-tail",
+                            }
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "uuid": "u-post",
+                        "parentUuid": "cb-self",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T15:02:00Z",
+                        "message": {"role": "user", "content": "Post-boundary turn"},
+                    },
+                    {
+                        "type": "assistant",
+                        "uuid": "a-post",
+                        "parentUuid": "u-post",
+                        "sessionId": sid,
+                        "timestamp": "2026-11-20T15:02:05Z",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "Post-boundary reply."}]},
+                    },
+                    {"type": "last-prompt", "lastPrompt": "Post-boundary turn", "leafUuid": "a-post", "sessionId": sid},
+                ],
+            )
+
+            provider = ClaudeProvider(root=root)
+            detail = provider.load_session(sid)
+
+            self.assertNotIn("linear_fallback_used", detail.warnings)
+            self.assertIn("compaction_gap", detail.warnings)
+            self.assertEqual([t.user_text for t in detail.turns], [
+                "Pre-boundary preserved head",
+                "Post-boundary turn",
+            ])
+            self.assertFalse(detail.turns[0].compaction_before)
+            self.assertTrue(detail.turns[1].compaction_before)
+
 
 if __name__ == "__main__":
     unittest.main()
