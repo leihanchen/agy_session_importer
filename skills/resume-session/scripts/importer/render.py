@@ -125,6 +125,19 @@ def _drilldown_marker(session_id: str, omitted_end: int) -> str:
     )
 
 
+def _compact_omission_marker(session_id: str, omitted_end: int) -> str:
+    ref = session_id or "latest"
+    if omitted_end <= 1:
+        return (
+            f"[Turn 1 details omitted due to max_chars budget; "
+            f"call turns {ref} --range 1:1 to inspect]"
+        )
+    return (
+        f"[Turns 1..{omitted_end} details omitted due to max_chars budget; "
+        f"call turns {ref} --range 1:{omitted_end} to inspect]"
+    )
+
+
 def _render_full(
     detail: SessionDetail,
     base_warnings: list[str],
@@ -251,7 +264,7 @@ def _render_compact_body(
                 for turn in turns[:tail_start]:
                     turn_lines.append(_render_turn_outline(turn))
             else:
-                turn_lines.append(_drilldown_marker(detail.summary.session_id, tail_start))
+                turn_lines.append(_compact_omission_marker(detail.summary.session_id, tail_start))
 
         if actual_tail > 0:
             turn_lines.append(f"## Recent Turns (last {actual_tail})")

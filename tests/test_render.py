@@ -306,6 +306,38 @@ class RenderTests(unittest.TestCase):
         self.assertTrue(tight["rendered"])
         self.assertIn("bounded_history", tight["warnings"])
 
+    def test_compact_mode_tight_budget_short_sessions_emit_valid_drilldown_range(self) -> None:
+        for turn_count, budget in ((2, 1100), (3, 1300), (5, 1400)):
+            detail = _make_detail(
+                turn_count,
+                provider="codex",
+                body_repeat=45,
+                session_id=f"sess-short-{turn_count}",
+                warnings=[],
+            )
+            result = ResolutionResult(
+                status="matched",
+                reason="latest_same_repo",
+                provider="codex",
+                cross_repo=False,
+                detail=detail,
+            )
+            env = render_show_envelope(result, mode="compact", max_chars=budget)
+            rendered = env["rendered"]
+            self.assertLessEqual(len(rendered), budget)
+            self.assertIn("bounded_history", env["warnings"])
+            self.assertNotIn("--range 2:1", rendered)
+
+            ranges = re.findall(r"--range (\d+):(\d+)", rendered)
+            self.assertTrue(ranges, f"Expected a valid drill-down --range marker in:\n{rendered}")
+            for start_s, end_s in ranges:
+                start_i, end_i = int(start_s), int(end_s)
+                self.assertEqual(start_i, 1)
+                self.assertGreaterEqual(end_i, start_i)
+                drill = render_turns_envelope(detail, start_i, end_i)
+                self.assertEqual(drill["start"], start_i)
+                self.assertEqual(drill["end"], end_i)
+
     def test_ambiguous_and_no_match_envelopes(self) -> None:
         cand1 = _make_summary(provider="codex", session_id="cand-1", title="First candidate")
         cand2 = _make_summary(provider="claude", session_id="cand-2", title="Second candidate")
