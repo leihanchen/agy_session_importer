@@ -1,0 +1,14 @@
+{
+  "name": "agy-session-importer",
+  "displayName": "Antigravity Session Importer",
+  "version": "0.1.0",
+  "description": "Read-only importer to search, inspect, and resume prior Codex and Claude Code sessions in Antigravity with safe untrusted-history boundaries.",
+  "suggestedPrompts": [
+    "Resume my latest Codex session",
+    "Continue my Claude Code session on this repo",
+    "Find my recent coding session about the last bug fix"
+  ],
+  "author": {
+    "name": "Leihan Chen"
+  }
+}
