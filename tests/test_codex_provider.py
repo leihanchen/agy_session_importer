@@ -785,6 +785,124 @@ class TestCodexProvider(unittest.TestCase):
             )
             self.assertFalse(provider.can_handle_path(claude_like))
 
+    def test_codex_zero_sentinel_timestamps_fall_back_to_ms_recency_and_rollout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex_home"
+            sid_ms = "019a0000-8888-7000-8000-000000000001"
+            sid_recency = "019a0000-8888-7000-8000-000000000002"
+            rollout_recency = root / "sessions" / f"rollout-{sid_recency}.jsonl"
+            _write_jsonl(
+                rollout_recency,
+                [
+                    {"timestamp": "2026-04-23T03:45:00Z", "type": "session_meta", "payload": {"id": sid_recency, "cwd": tmp}},
+                    {"timestamp": "2026-04-23T03:45:05Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Recency fallback"}]}},
+                ],
+            )
+            _create_state_db(
+                root / "state_1.sqlite",
+                [
+                    {
+                        "id": sid_ms,
+                        "created_at": 0,
+                        "updated_at": 0,
+                        "created_at_ms": 1776916000000,
+                        "updated_at_ms": 1776916300000,
+                        "cwd": tmp,
+                        "title": "MS fallback",
+                    },
+                    {
+                        "id": sid_recency,
+                        "rollout_path": str(rollout_recency),
+                        "created_at": 0,
+                        "updated_at": 0,
+                        "created_at_ms": None,
+                        "updated_at_ms": None,
+                        "recency_at": 1776916200,
+                        "cwd": tmp,
+                        "title": "Recency fallback",
+                    },
+                ],
+            )
+
+            provider = CodexProvider(root=root)
+            summaries, warnings = provider.list_sessions()
+            self.assertEqual(warnings, [])
+            self.assertEqual([s.session_id for s in summaries], [sid_ms, sid_recency])
+            by_id = {s.session_id: s for s in summaries}
+            self.assertEqual(by_id[sid_ms].created_at, normalize_timestamp(1776916000000))
+            self.assertEqual(by_id[sid_ms].updated_at, normalize_timestamp(1776916300000))
+            self.assertEqual(by_id[sid_recency].created_at, "2026-04-23T03:45:00Z")
+            self.assertEqual(by_id[sid_recency].updated_at, normalize_timestamp(1776916200))
+
+    def test_codex_tool_output_envelope_completed_does_not_mask_inner_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex_home"
+            sid = "019a0000-9999-7000-8000-000000000001"
+            rollout = root / "sessions" / f"rollout-{sid}.jsonl"
+            _write_jsonl(
+                rollout,
+                [
+                    {"timestamp": "2026-11-20T10:00:00Z", "type": "session_meta", "payload": {"id": sid, "cwd": tmp}},
+                    {"timestamp": "2026-11-20T10:00:01Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Run failing checks"}]}},
+                    {"timestamp": "2026-11-20T10:00:02Z", "type": "response_item", "payload": {"type": "function_call", "call_id": "c1", "name": "exec", "arguments": "{}"}},
+                    {"timestamp": "2026-11-20T10:00:03Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "c1", "status": "completed", "success": True, "output": {"metadata": {"exit_code": 1}, "output": "boom"}}},
+                    {"timestamp": "2026-11-20T10:00:04Z", "type": "response_item", "payload": {"type": "function_call", "call_id": "c2", "name": "exec", "arguments": "{}"}},
+                    {"timestamp": "2026-11-20T10:00:05Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "c2", "status": "completed", "output": "Process exited with code 2"}},
+                    {"timestamp": "2026-11-20T10:00:06Z", "type": "response_item", "payload": {"type": "custom_tool_call", "call_id": "c3", "name": "exec", "input": "false"}},
+                    {"timestamp": "2026-11-20T10:00:07Z", "type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "c3", "status": "completed", "output": {"status": "completed", "body": "Process exited with code 1"}}},
+                    {"timestamp": "2026-11-20T10:00:08Z", "type": "response_item", "payload": {"type": "function_call", "call_id": "c4", "name": "tool", "arguments": "{}"}},
+                    {"timestamp": "2026-11-20T10:00:09Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "c4", "status": "completed", "output": {"is_error": True, "body": "bad"}}},
+                ],
+            )
+            provider = CodexProvider(root=root)
+            detail = provider.load_session(sid)
+            self.assertEqual([te.status for te in detail.turns[0].tool_events], ["error", "error", "error", "error"])
+
+    def test_codex_no_cross_session_warning_bleed_with_uuidless_corrupt_rollout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "codex_home"
+            clean_id = "019a0000-aaaa-7000-8000-000000000001"
+            clean_rollout = root / "sessions" / f"rollout-{clean_id}.jsonl"
+            _write_jsonl(
+                clean_rollout,
+                [
+                    {"timestamp": "2026-11-20T10:00:00Z", "type": "session_meta", "payload": {"id": clean_id, "cwd": tmp}},
+                    {"timestamp": "2026-11-20T10:00:01Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Healthy session"}]}},
+                ],
+            )
+            _create_state_db(
+                root / "state_1.sqlite",
+                [
+                    {
+                        "id": clean_id,
+                        "rollout_path": str(clean_rollout),
+                        "created_at": 1776916000,
+                        "updated_at": 1776916010,
+                        "cwd": tmp,
+                        "title": "Healthy session",
+                    }
+                ],
+            )
+            # Unrelated UUID-less files force _resolve_fast_by_id to fall back to _build_inventory.
+            bad_no_uuid = root / "sessions" / "rollout-custom-corrupt.jsonl"
+            bad_no_uuid.write_text(
+                "{not-json\n" + json.dumps({"timestamp": "2026-11-20T09:00:00Z", "type": "session_meta", "payload": {"id": "custom-no-uuid-id", "cwd": tmp}}) + "\n",
+                encoding="utf-8",
+            )
+            zst_no_uuid = root / "sessions" / "rollout-custom-zst.jsonl.zst"
+            zst_no_uuid.write_bytes(b"fake-zst")
+
+            provider = CodexProvider(root=root)
+            with mock.patch.object(shutil, "which", return_value=None):
+                detail = provider.load_session(clean_id)
+                self.assertEqual(detail.warnings, [])
+                self.assertEqual(detail.summary.warnings, [])
+                self.assertEqual(detail.turns[0].user_text, "Healthy session")
+
+                bad_detail = provider.load_session("custom-no-uuid-id")
+                self.assertTrue(any("malformed" in w for w in bad_detail.warnings))
+                self.assertFalse(any("zstd" in w for w in bad_detail.warnings))
+
 
 if __name__ == "__main__":
     unittest.main()

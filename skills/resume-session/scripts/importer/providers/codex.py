@@ -81,6 +81,17 @@ def _add_unique(items: list[str], value: str) -> None:
         items.append(value)
 
 
+def _normalize_nonzero_ts(value: Any) -> str:
+    """Normalize a timestamp while treating zero sentinels (0 / '0') as absent."""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return "" if value == 0 else normalize_timestamp(value)
+    if isinstance(value, str) and value.strip() in {"", "0", "0.0"}:
+        return ""
+    return normalize_timestamp(value)
+
+
 def _strip_codex_envelopes(text: str) -> str:
     cleaned = _AGENTS_MD_RE.sub("", text)
     return _USER_INSTRUCTIONS_RE.sub("", cleaned)
@@ -312,12 +323,25 @@ def _normalize_tool_output(output: Any) -> tuple[str, str | None]:
     else:
         raw_text = str(output)
 
-    if detected_status is None:
+    if detected_status not in {"error", "aborted"}:
         if _EXIT_CODE_RE.search(raw_text):
             detected_status = "error"
-        elif _EXIT_ZERO_RE.search(raw_text):
+        elif detected_status is None and _EXIT_ZERO_RE.search(raw_text):
             detected_status = "ok"
     return raw_text, detected_status
+
+
+def _resolve_output_status(
+    envelope_status: str | None,
+    body_status: str | None,
+    default: str = "ok",
+) -> str:
+    """Prioritize error/aborted signals from either envelope or body before ok."""
+    if envelope_status in {"error", "aborted"}:
+        return envelope_status
+    if body_status in {"error", "aborted"}:
+        return body_status
+    return envelope_status or body_status or default
 
 
 def _format_args_summary(
@@ -776,7 +800,7 @@ class CodexProvider(SessionProvider):
     def _scan_rollout_summary(
         self,
         path: Path,
-        warnings: list[str],
+        warnings: list[str] | None,
         *,
         archived: bool,
     ) -> dict[str, Any]:
@@ -916,7 +940,8 @@ class CodexProvider(SessionProvider):
             if malformed:
                 msg = f"codex_malformed_jsonl_lines:{malformed}"
                 _add_unique(file_warnings, msg)
-                _add_unique(warnings, msg)
+                if warnings is not None:
+                    _add_unique(warnings, msg)
             prompts = response_prompts if saw_response_msg else legacy_prompts
             info["turn_count"] = len(prompts)
             if prompts:
@@ -925,8 +950,9 @@ class CodexProvider(SessionProvider):
 
         if path.name.lower().endswith(".jsonl.zst"):
             lines = _iter_rollout_lines(path, file_warnings)
-            for fw in file_warnings:
-                _add_unique(warnings, fw)
+            if warnings is not None:
+                for fw in file_warnings:
+                    _add_unique(warnings, fw)
             if lines is not None:
                 _scan_lines(lines)
         else:
@@ -936,7 +962,8 @@ class CodexProvider(SessionProvider):
             except OSError as exc:
                 msg = f"codex_rollout_read_error:{path}:{exc}"
                 _add_unique(file_warnings, msg)
-                _add_unique(warnings, msg)
+                if warnings is not None:
+                    _add_unique(warnings, msg)
         return info
 
     def _discover_rollout_files(self, *, include_archived: bool) -> list[tuple[Path, bool]]:
@@ -977,15 +1004,15 @@ class CodexProvider(SessionProvider):
             row.get("git_branch") or (rollout_scan["git_branch"] if rollout_scan else "") or ""
         ).strip()
         created_at = (
-            normalize_timestamp(row.get("created_at"))
-            or normalize_timestamp(row.get("created_at_ms"))
+            _normalize_nonzero_ts(row.get("created_at"))
+            or _normalize_nonzero_ts(row.get("created_at_ms"))
             or (rollout_scan["created_at"] if rollout_scan else "")
         )
         updated_at = (
-            normalize_timestamp(row.get("updated_at"))
-            or normalize_timestamp(row.get("updated_at_ms"))
-            or normalize_timestamp(row.get("recency_at"))
-            or normalize_timestamp(row.get("recency_at_ms"))
+            _normalize_nonzero_ts(row.get("updated_at"))
+            or _normalize_nonzero_ts(row.get("updated_at_ms"))
+            or _normalize_nonzero_ts(row.get("recency_at"))
+            or _normalize_nonzero_ts(row.get("recency_at_ms"))
             or (rollout_scan["updated_at"] if rollout_scan else "")
         )
 
@@ -1047,11 +1074,13 @@ class CodexProvider(SessionProvider):
         *,
         include_archived: bool,
         warnings: list[str],
+        include_scan_warnings: bool = True,
     ) -> dict[str, dict[str, Any]]:
         state_rows, state_db = self._read_state_threads(warnings)
         history_overview, history_db = self._read_history_overview(warnings)
         index_entries = self._read_session_index(warnings)
         rollout_files = self._discover_rollout_files(include_archived=include_archived)
+        scan_warnings = warnings if include_scan_warnings else None
 
         disk_by_sid: dict[str, tuple[Path, bool]] = {}
         extra_scans: list[dict[str, Any]] = []
@@ -1061,7 +1090,7 @@ class CodexProvider(SessionProvider):
             if sid_hint and sid_hint in state_rows:
                 disk_by_sid[sid_hint] = (file_path, is_arch)
             else:
-                scanned = self._scan_rollout_summary(file_path, warnings, archived=is_arch)
+                scanned = self._scan_rollout_summary(file_path, scan_warnings, archived=is_arch)
                 sid = scanned["session_id"] or str(file_path.resolve())
                 scanned["session_id"] = sid
                 extra_scans.append(scanned)
@@ -1079,7 +1108,7 @@ class CodexProvider(SessionProvider):
 
             rollout_scan: dict[str, Any] | None = None
             if rollout_file is not None and (not archived_flag or include_archived):
-                rollout_scan = self._scan_rollout_summary(rollout_file, warnings, archived=archived_flag)
+                rollout_scan = self._scan_rollout_summary(rollout_file, scan_warnings, archived=archived_flag)
 
             summary = self._summary_from_state_row(
                 sid,
@@ -1335,7 +1364,7 @@ class CodexProvider(SessionProvider):
             if ptype in {"function_call_output", "custom_tool_call_output"}:
                 call_id = str(payload.get("call_id") or payload.get("id") or "")
                 raw_out, detected_status = _normalize_tool_output(payload.get("output"))
-                status = _status_from_mapping(payload) or detected_status or "ok"
+                status = _resolve_output_status(_status_from_mapping(payload), detected_status)
                 out_summary, out_truncated = _format_output_summary(
                     raw_out, max_tool_chars, secret_counter
                 )
@@ -1661,7 +1690,7 @@ class CodexProvider(SessionProvider):
                         tool_name=qualified,
                         arguments_summary="",
                         output_summary=out_summary,
-                        status=detected or "ok",
+                        status=_resolve_output_status(_status_from_mapping(obj), detected),
                         truncated=out_trunc,
                     )
                 )
@@ -1905,7 +1934,7 @@ class CodexProvider(SessionProvider):
             return summary, rollout_file
 
         file_path, is_arch = disk_by_sid[sid]
-        scanned = self._scan_rollout_summary(file_path, warnings, archived=is_arch)
+        scanned = self._scan_rollout_summary(file_path, None, archived=is_arch)
         title, updated_at = _merge_index_metadata(
             "",
             scanned["updated_at"],
@@ -1981,7 +2010,11 @@ class CodexProvider(SessionProvider):
         warnings = []
         summary, rollout_path = self._resolve_fast_by_id(ref, warnings)
         if summary is None:
-            inventory = self._build_inventory(include_archived=True, warnings=warnings)
+            inventory = self._build_inventory(
+                include_archived=True,
+                warnings=warnings,
+                include_scan_warnings=False,
+            )
             ref_lower = ref.strip().lower()
             exact = None
             prefix_matches: list[dict[str, Any]] = []
