@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" fill="none">
+  <!-- Outer container has >= 12.5% transparent margin (16px on 128px canvas) -->
+  <rect x="16" y="16" width="96" height="96" rx="22" fill="#0F172A" stroke="#38BDF8" stroke-width="4" />
+  <!-- Source CLI session window (left) -->
+  <rect x="28" y="34" width="38" height="44" rx="6" fill="#1E293B" stroke="#94A3B8" stroke-width="3" />
+  <path d="M35 46 L42 52 L35 58" stroke="#38BDF8" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" />
+  <line x1="45" y1="58" x2="58" y2="58" stroke="#E2E8F0" stroke-width="3.2" stroke-linecap="round" />
+  <line x1="35" y1="68" x2="56" y2="68" stroke="#64748B" stroke-width="3" stroke-linecap="round" />
+  <!-- Target Antigravity conversation card (right) -->
+  <rect x="64" y="48" width="36" height="46" rx="7" fill="#1D4ED8" stroke="#E0F2FE" stroke-width="3" />
+  <line x1="72" y1="62" x2="92" y2="62" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" />
+  <line x1="72" y1="71" x2="88" y2="71" stroke="#BFDBFE" stroke-width="3" stroke-linecap="round" />
+  <line x1="72" y1="80" x2="84" y2="80" stroke="#93C5FD" stroke-width="3" stroke-linecap="round" />
+  <!-- Import transfer arrow bridging source to target -->
+  <path d="M52 86 H76 M70 79 L77 86 L70 93" stroke="#22D3EE" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+</svg>

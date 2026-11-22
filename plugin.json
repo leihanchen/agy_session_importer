@@ -1,0 +1,16 @@
+{
+  "name": "agy-session-importer",
+  "displayName": "Antigravity Session Importer",
+  "version": "0.2.0",
+  "description": "Read-only importer and interactive Session Importer UI to discover, inspect full turn histories, and resume prior CLI coding agent sessions (such as Codex and Claude Code) in Antigravity with safe untrusted-history boundaries.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Open Session Importer to browse and resume a prior coding session",
+    "Resume my latest Codex session on this repo",
+    "Continue my Claude Code session about the recent bug fix"
+  ],
+  "author": {
+    "name": "Leihan Chen"
+  },
+  "repository": "https://github.com/leihanchen/agy_session_importer"
+}

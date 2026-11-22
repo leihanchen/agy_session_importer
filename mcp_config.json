@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "session_importer": {
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/skills/resume-session/scripts/mcp_server.py",
+        "--data-dir",
+        "${PLUGIN_DATA}"
+      ]
+    }
+  }
+}
