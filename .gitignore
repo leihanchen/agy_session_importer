@@ -26,3 +26,6 @@ tmp/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Node dependencies for UI build (built app.html is committed)
+ui_src/node_modules/
